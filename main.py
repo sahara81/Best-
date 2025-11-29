@@ -1,5 +1,8 @@
 import os
 import logging
+import asyncio
+from aiohttp import web
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,18 +17,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
 # ---------- CONFIG ----------
-# BOT_TOKEN ko environment variable me rakhna best hai (Render/Koyeb ke liye):
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YAHAN_TOKEN_DAAL_DE-TEMP")
-
-# Default delay in seconds (env se override ho sakta hai)
 DEFAULT_DELETE_DELAY = int(os.getenv("DELETE_DELAY", "300"))  # 300 sec = 5 min
 
+PORT = int(os.getenv("PORT", "10000"))  # Render web service ke liye
 
-# ---------- JOB: MESSAGE DELETE KARNA ----------
+
+# ---------- TELEGRAM PART ----------
+
 async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
     chat_id = job_data["chat_id"]
@@ -38,7 +40,6 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Delete nahi ho paya (msg {message_id}, chat {chat_id}): {e}")
 
 
-# ---------- HANDLER: HAR MESSAGE PE DELETE JOB LAGANA ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
@@ -49,7 +50,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = chat.id
     message_id = message.message_id
 
-    # Per-chat delay: agar chat_data me set hai to woh, warna default
     delay = context.chat_data.get("delay", DEFAULT_DELETE_DELAY)
 
     logger.info(
@@ -64,7 +64,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- HELPER: ADMIN CHECK ----------
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
     user = update.effective_user
@@ -72,7 +71,6 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if chat is None or user is None:
         return False
 
-    # Private chat me user hi malik hai, allowed
     if chat.type == "private":
         return True
 
@@ -84,25 +82,23 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return False
 
 
-# ---------- /start COMMAND ----------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_delay = context.chat_data.get("delay", DEFAULT_DELETE_DELAY)
     text = (
         "👋 Namaste! Main auto-delete bot hoon.\n\n"
         "Jo bhi message group me aayega, main kuch time baad delete kar dunga.\n\n"
-        "Current delete delay: <b>{} seconds</b>\n\n"
+        f"Current delete delay: <b>{chat_delay} seconds</b>\n\n"
         "Commands:\n"
         "/delay – current delay dekho\n"
-        "/delay &lt;seconds&gt; – delay change karo (sirf admins)\n\n"
+        "/delay <seconds> – delay change karo (sirf admins)\n\n"
         "Example:\n"
         "<code>/delay 60</code> → 1 minute baad delete\n"
         "<code>/delay 300</code> → 5 minute baad delete"
-    ).format(chat_delay)
+    )
 
     await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
-# ---------- /delay COMMAND ----------
 async def delay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat = update.effective_chat
@@ -110,7 +106,6 @@ async def delay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message is None or chat is None:
         return
 
-    # Agar argument nahi diya -> current delay batao
     if len(context.args) == 0:
         current_delay = context.chat_data.get("delay", DEFAULT_DELETE_DELAY)
         await message.reply_text(
@@ -121,12 +116,10 @@ async def delay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Delay change karne ke liye admin check
     if not await is_admin(update, context):
         await message.reply_text("❌ Sirf group admins delay change kar sakte hain.")
         return
 
-    # Argument parse karna
     arg = context.args[0]
     try:
         new_delay = int(arg)
@@ -136,7 +129,6 @@ async def delay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Galat value. Example: /delay 60  ya  /delay 300")
         return
 
-    # Limit thoda reasonable rakhte hain (0–86400 sec = 24h)
     if new_delay > 86400:
         await message.reply_text("❌ Max 86400 seconds (24 ghante) tak allowed hai.")
         return
@@ -153,20 +145,51 @@ async def on_startup(app):
     logger.info("Bot started and ready to auto-delete messages!")
 
 
-def main():
-    if BOT_TOKEN == "YAHAN_TOKEN_DAAL_DE-TEMP":
-        raise RuntimeError("BOT_TOKEN set kar pehle! Environment variable ya code me.")
+def build_telegram_app():
+    if BOT_TOKEN == "YAHAN_TOKEN_DAAL-DE-TEMP":
+        raise RuntimeError("BOT_TOKEN set kar pehle! Environment variable me.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
-
-    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("delay", delay_command))
-
-    # Sab messages (admins + members + bots)
     app.add_handler(MessageHandler(filters.ALL, handle_message))
+    return app
 
-    app.run_polling(drop_pending_updates=True)
+
+# ---------- DUMMY WEB SERVER (Render ke liye) ----------
+
+async def handle_root(request):
+    return web.Response(text="Telegram auto-delete bot running 🤖")
+
+
+async def start_web_app():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Web server running on port {PORT}")
+
+
+# ---------- MAIN (donon ko parallel chalao) ----------
+
+async def main_async():
+    tg_app = build_telegram_app()
+
+    loop = asyncio.get_running_loop()
+    # Telegram bot polling ko ek alag task me chalao
+    bot_task = loop.create_task(tg_app.run_polling(stop_signals=None))
+
+    # Web server start karo
+    await start_web_app()
+
+    # Dono parallel chalenge
+    await bot_task
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
